@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>FLAG FALL RACE</title>
+<style>
+  html,body{margin:0;height:100%;overscroll-behavior:none;-webkit-text-size-adjust:100%;background:#0a0b0e;overflow:hidden;color:#fff;
+    font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-user-select:none;user-select:none;touch-action:none;-webkit-tap-highlight-color:transparent}
+  canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #count{position:fixed;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;
+    font-weight:800;font-size:min(30vh,34vw);letter-spacing:-.02em;line-height:1;opacity:0;pointer-events:none;
+    text-shadow:0 0 60px rgba(255,255,255,.22),0 6px 30px rgba(0,0,0,.6)}
+  #win{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.9);opacity:0;pointer-events:none;
+    min-width:min(78vw,380px);box-sizing:border-box;padding:26px 30px 28px;text-align:center;border-radius:26px;
+    background:rgba(13,14,18,.84);border:1px solid rgba(255,255,255,.09);
+    box-shadow:0 30px 90px rgba(0,0,0,.65),inset 0 1px 0 rgba(255,255,255,.06);
+    -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+    transition:opacity .45s ease,transform .5s cubic-bezier(.2,.9,.3,1.15)}
+  #win.show{opacity:1;transform:translate(-50%,-50%) scale(1)}
+  #win .trophy{font-size:clamp(42px,9vw,64px);line-height:1;filter:drop-shadow(0 6px 18px rgba(255,200,60,.35))}
+  #wflag{display:block;margin:14px auto 10px;width:84px;height:56px;border-radius:10px;
+    box-shadow:0 6px 22px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.12)}
+  #wname{font-weight:800;font-size:clamp(26px,6.4vw,46px);letter-spacing:.05em;line-height:1.1}
+  #win .lab{margin-top:20px;font-size:13px;letter-spacing:.28em;color:rgba(255,255,255,.55);font-weight:600}
+  #wnum{font-weight:800;font-size:clamp(56px,13vw,92px);line-height:1.05;font-variant-numeric:tabular-nums}
+  #snd{position:fixed;right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));
+    width:38px;height:38px;border-radius:50%;border:1px solid rgba(255,255,255,.12);background:rgba(18,19,24,.7);
+    color:#fff;font-size:16px;opacity:.5;cursor:pointer;padding:0}
+  #snd:hover{opacity:.9}
+  @media (max-height:520px){
+    #win{padding:14px 22px 16px}#win .trophy{font-size:34px}
+    #wflag{width:60px;height:40px;margin:8px auto 6px}#wname{font-size:24px}
+    #win .lab{margin-top:10px}#wnum{font-size:46px}
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="count"></div>
+<div id="win">
+  <div class="trophy">🏆</div>
+  <canvas id="wflag" width="168" height="112"></canvas>
+  <div id="wname"></div>
+  <div class="lab">NEXT FALL IN</div>
+  <div id="wnum">7</div>
+</div>
+<button id="snd" aria-label="Toggle sound">🔊</button>
+
+<script>
+'use strict';
+/* =====================================================================
+   FLAG FALL RACE
+   Sections: Config · Flags · Obstacle · Course · Ball · World (physics)
+             · RaceSim (state machine) · Camera · Renderer · Audio · Game
+   ===================================================================== */
+
+/* ============================== CONFIG ============================== */
+const W = 800;                 // world width (world units)
+const GRAVITY = 900;           // units / s^2
+const STEP = 1 / 120;          // fixed physics timestep
+const SUBSTEPS = 2;            // physics substeps per fixed step  => 240 Hz solver
+const MAX_SPEED = 950;         // terminal speed clamp (prevents tunneling)
+const LIN_DRAG = 0.22;         // mild air drag (1/s)
+const ANG_DRAG = 0.12;
+const MAX_SPIN = 70;
+const REST_THRESHOLD = 35;     // below this impact speed restitution is zero (kills micro-bounce)
+const COUNTDOWN = 3;
+const LEAD_IN = 0.9;           // seconds showing the course before "3"
+const WINNER_SECONDS = 7;
+const RACE_TIMEOUT = 220;      // safety: if nobody finishes, the lowest ball (by position) wins
+const TAU = Math.PI * 2;
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = (Math.random() * (i + 1)) | 0;
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+/* ============================== FLAGS =============================== */
+/* Flags are drawn with vector code (emoji flags do not render on Windows). */
+function star(c, cx, cy, R, n, ratio) {
+  c.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / n;
+    const rr = i % 2 ? R * ratio : R;
+    c.lineTo(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr);
+  }
+  c.closePath(); c.fill();
+}
+function drawUK(c, x, y, w, h) {
+  c.save(); c.beginPath(); c.rect(x, y, w, h); c.clip(); c.translate(x, y);
+  c.fillStyle = '#012169'; c.fillRect(0, 0, w, h);
+  const line = (x1, y1, x2, y2) => { c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke(); };
+  c.strokeStyle = '#fff'; c.lineWidth = h * 0.2; line(0, 0, w, h); line(w, 0, 0, h);
+  c.strokeStyle = '#C8102E'; c.lineWidth = h * 0.07; line(0, 0, w, h); line(w, 0, 0, h);
+  c.strokeStyle = '#fff'; c.lineWidth = h * 0.34; line(w / 2, 0, w / 2, h); line(0, h / 2, w, h / 2);
+  c.strokeStyle = '#C8102E'; c.lineWidth = h * 0.2; line(w / 2, 0, w / 2, h); line(0, h / 2, w, h / 2);
+  c.restore();
+}
+function flagBD(c, w, h) {
+  c.fillStyle = '#006a4e'; c.fillRect(0, 0, w, h);
+  c.fillStyle = '#f42a41'; c.beginPath(); c.arc(w * 0.47, h * 0.5, h * 0.3, 0, TAU); c.fill();
+}
+function flagUS(c, w, h) {
+  const sh = h / 13;
+  for (let i = 0; i < 13; i++) { c.fillStyle = i % 2 ? '#ffffff' : '#b22234'; c.fillRect(0, i * sh, w, sh + 0.6); }
+  c.fillStyle = '#3c3b6e'; c.fillRect(0, 0, w * 0.42, sh * 7);
+  c.fillStyle = '#fff';
+  for (let r = 0; r < 5; r++) for (let k = 0; k < 6; k++) star(c, w * 0.42 * (k + 0.5) / 6, sh * 7 * (r + 0.5) / 5, sh * 0.5, 5, 0.42);
+}
+function flagUK(c, w, h) { drawUK(c, 0, 0, w, h); }
+function flagJP(c, w, h) {
+  c.fillStyle = '#fff'; c.fillRect(0, 0, w, h);
+  c.fillStyle = '#bc002d'; c.beginPath(); c.arc(w / 2, h / 2, h * 0.3, 0, TAU); c.fill();
+}
+function flagBR(c, w, h) {
+  c.fillStyle = '#009b3a'; c.fillRect(0, 0, w, h);
+  c.fillStyle = '#ffdf00'; c.beginPath();
+  c.moveTo(w * 0.5, h * 0.1); c.lineTo(w * 0.9, h * 0.5); c.lineTo(w * 0.5, h * 0.9); c.lineTo(w * 0.1, h * 0.5); c.closePath(); c.fill();
+  c.fillStyle = '#002776'; c.beginPath(); c.arc(w / 2, h / 2, h * 0.27, 0, TAU); c.fill();
+  c.save(); c.beginPath(); c.arc(w / 2, h / 2, h * 0.27, 0, TAU); c.clip();
+  c.strokeStyle = '#fff'; c.lineWidth = h * 0.05; c.beginPath();
+  c.arc(w * 0.5, h * 0.9, h * 0.55, -Math.PI * 0.82, -Math.PI * 0.18); c.stroke(); c.restore();
+}
+function flagDE(c, w, h) {
+  c.fillStyle = '#000'; c.fillRect(0, 0, w, h / 3 + 1);
+  c.fillStyle = '#dd0000'; c.fillRect(0, h / 3, w, h / 3 + 1);
+  c.fillStyle = '#ffce00'; c.fillRect(0, 2 * h / 3, w, h / 3 + 1);
+}
+function flagFR(c, w, h) {
+  c.fillStyle = '#0055a4'; c.fillRect(0, 0, w / 3 + 1, h);
+  c.fillStyle = '#fff'; c.fillRect(w / 3, 0, w / 3 + 1, h);
+  c.fillStyle = '#ef4135'; c.fillRect(2 * w / 3, 0, w / 3 + 1, h);
+}
+function flagIN(c, w, h) {
+  c.fillStyle = '#ff9933'; c.fillRect(0, 0, w, h / 3 + 1);
+  c.fillStyle = '#fff'; c.fillRect(0, h / 3, w, h / 3 + 1);
+  c.fillStyle = '#138808'; c.fillRect(0, 2 * h / 3, w, h / 3 + 1);
+  c.strokeStyle = '#000080'; c.lineWidth = 2; c.beginPath(); c.arc(w / 2, h / 2, h * 0.14, 0, TAU); c.stroke();
+  c.lineWidth = 1;
+  for (let i = 0; i < 12; i++) {
+    const a = i * TAU / 12; c.beginPath();
+    c.moveTo(w / 2, h / 2); c.lineTo(w / 2 + Math.cos(a) * h * 0.14, h / 2 + Math.sin(a) * h * 0.14); c.stroke();
+  }
+}
+const LEAF = [[0,-1],[.15,-.68],[.38,-.78],[.3,-.38],[.62,-.52],[.52,-.2],[.9,-.1],[.62,.14],[.72,.3],[.22,.2],
+  [.1,.2],[.1,.62],[-.1,.62],[-.1,.2],[-.22,.2],[-.72,.3],[-.62,.14],[-.9,-.1],[-.52,-.2],[-.62,-.52],[-.3,-.38],[-.38,-.78],[-.15,-.68]];
+function flagCA(c, w, h) {
+  c.fillStyle = '#d80621'; c.fillRect(0, 0, w, h);
+  c.fillStyle = '#fff'; c.fillRect(w * 0.25, 0, w * 0.5, h);
+  c.fillStyle = '#d80621'; c.beginPath();
+  LEAF.forEach((p, i) => { const x = w / 2 + p[0] * h * 0.4, y = h / 2 + p[1] * h * 0.4; i ? c.lineTo(x, y) : c.moveTo(x, y); });
+  c.closePath(); c.fill();
+}
+function flagAU(c, w, h) {
+  c.fillStyle = '#012169'; c.fillRect(0, 0, w, h);
+  drawUK(c, 0, 0, w * 0.5, h * 0.5);
+  c.fillStyle = '#fff';
+  star(c, w * 0.25, h * 0.77, h * 0.17, 7, 0.5);
+  [[.74, .2], [.62, .42], [.87, .45], [.74, .76]].forEach(p => star(c, w * p[0], h * p[1], h * 0.08, 7, 0.5));
+  star(c, w * 0.8, h * 0.57, h * 0.045, 5, 0.45);
+}
+
+/* Slightly different physical properties per country; differences are tiny. */
+const COUNTRIES = [
+  { name: 'BANGLADESH',     code: 'BGD', r: 16.0, density: 1.00, rest: 0.46, fric: 0.24, draw: flagBD },
+  { name: 'UNITED STATES',  code: 'USA', r: 16.4, density: 0.98, rest: 0.45, fric: 0.23, draw: flagUS },
+  { name: 'UNITED KINGDOM', code: 'GBR', r: 15.8, density: 1.02, rest: 0.47, fric: 0.25, draw: flagUK },
+  { name: 'JAPAN',          code: 'JPN', r: 16.2, density: 1.01, rest: 0.44, fric: 0.24, draw: flagJP },
+  { name: 'BRAZIL',         code: 'BRA', r: 16.6, density: 0.97, rest: 0.46, fric: 0.22, draw: flagBR },
+  { name: 'GERMANY',        code: 'GER', r: 15.6, density: 1.03, rest: 0.45, fric: 0.26, draw: flagDE },
+  { name: 'FRANCE',         code: 'FRA', r: 16.0, density: 1.00, rest: 0.48, fric: 0.23, draw: flagFR },
+  { name: 'INDIA',          code: 'IND', r: 16.3, density: 0.99, rest: 0.44, fric: 0.25, draw: flagIN },
+  { name: 'CANADA',         code: 'CAN', r: 15.9, density: 1.02, rest: 0.47, fric: 0.24, draw: flagCA },
+  { name: 'AUSTRALIA',      code: 'AUS', r: 16.5, density: 0.98, rest: 0.46, fric: 0.26, draw: flagAU },
+];
+
+/* ============================= OBSTACLE ============================= */
+/* An obstacle is a group of capsules (segments with radius; circles are
+   degenerate segments). Shapes are stored in LOCAL space around a pivot
+   (x,y). Kinds:
+     static : never moves (shapes are given in world coords, pivot = 0,0)
+     rotor  : rotates around pivot at constant omega
+     swing  : oscillates in angle  a0 + amp*sin(2*pi*f*t + phase)
+     slider : translates  (ax,ay)*sin(2*pi*f*t + phase)
+   Velocity of the pivot (vx,vy) and angular velocity w are computed
+   analytically, so ball collisions use the true surface velocity. */
+class Obstacle {
+  constructor(o) {
+    this.kind = o.kind || 'static';
+    this.x = o.x || 0; this.y = o.y || 0;
+    this.angle0 = o.angle || 0; this.omega = o.omega || 0; this.amp = o.amp || 0;
+    this.ax = o.ax || 0; this.ay = o.ay || 0; this.freq = o.freq || 0; this.phase = o.phase || 0;
+    this.bounce = o.bounce == null ? 1 : o.bounce;
+    this.grip = o.grip == null ? 1 : o.grip;
+    this.style = o.style || 'wall';
+    this.shapes = o.shapes;
+    this.dynamic = this.kind !== 'static';
+    this.ws = this.shapes.map(s => ({ ax: 0, ay: 0, bx: 0, by: 0, r: s.r, circ: !!s.circ }));
+    this.cx = this.x; this.cy = this.y; this.vx = 0; this.vy = 0; this.w = 0; this.ang = this.angle0;
+    this.update(0);
+    // broad-phase bounds (axis aligned, covers full range of motion)
+    if (!this.dynamic) {
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const s of this.ws) {
+        x0 = Math.min(x0, s.ax - s.r, s.bx - s.r); x1 = Math.max(x1, s.ax + s.r, s.bx + s.r);
+        y0 = Math.min(y0, s.ay - s.r, s.by - s.r); y1 = Math.max(y1, s.ay + s.r, s.by + s.r);
+      }
+      this.bx0 = x0; this.by0 = y0; this.bx1 = x1; this.by1 = y1;
+    } else {
+      let R = 0;
+      for (const s of this.shapes) {
+        R = Math.max(R, Math.hypot(s.x1, s.y1) + s.r, Math.hypot(s.x2, s.y2) + s.r);
+      }
+      this.bx0 = this.x - R - Math.abs(this.ax); this.bx1 = this.x + R + Math.abs(this.ax);
+      this.by0 = this.y - R - Math.abs(this.ay); this.by1 = this.y + R + Math.abs(this.ay);
+    }
+  }
+  update(t) {
+    switch (this.kind) {
+      case 'rotor':
+        this.ang = this.angle0 + this.omega * t; this.w = this.omega; break;
+      case 'swing': {
+        const th = TAU * this.freq * t + this.phase;
+        this.ang = this.angle0 + this.amp * Math.sin(th);
+        this.w = this.amp * TAU * this.freq * Math.cos(th); break;
+      }
+      case 'slider': {
+        const th = TAU * this.freq * t + this.phase, s = Math.sin(th), c = Math.cos(th);
+        this.cx = this.x + this.ax * s; this.cy = this.y + this.ay * s;
+        this.vx = this.ax * TAU * this.freq * c; this.vy = this.ay * TAU * this.freq * c; break;
+      }
+      default: this.ang = this.angle0;
+    }
+    const ca = Math.cos(this.ang), sa = Math.sin(this.ang);
+    for (let i = 0; i < this.shapes.length; i++) {
+      const s = this.shapes[i], w = this.ws[i];
+      w.ax = this.cx + s.x1 * ca - s.y1 * sa; w.ay = this.cy + s.x1 * sa + s.y1 * ca;
+      w.bx = this.cx + s.x2 * ca - s.y2 * sa; w.by = this.cy + s.x2 * sa + s.y2 * ca;
+    }
+  }
+}
+
+/* ============================== COURSE ============================== */
+/* Everything is data-driven: add/modify obstacles with the helpers below.
+   Sections are stacked top to bottom using the running cursor `y`.    */
+function buildCourse() {
+  const obs = [];
+  const add = o => { obs.push(new Obstacle(o)); };
+  // thick line (wall / slope / deflector)
+  const seg = (x1, y1, x2, y2, o = {}) => add({ shapes: [{ x1, y1, x2, y2, r: o.r || 6 }], style: o.style || 'wall', bounce: o.bounce, grip: o.grip });
+  // circular bumper
+  const dot = (x, y, r, o = {}) => add({ shapes: [{ x1: x, y1: y, x2: x, y2: y, r, circ: true }], style: o.style || 'bumper', bounce: o.bounce == null ? 1.7 : o.bounce });
+  // two slopes forming a funnel opening
+  const funnel = (y0, h, cx, gap, o) => { seg(0, y0, cx - gap / 2, y0 + h, o); seg(W, y0, cx + gap / 2, y0 + h, o); };
+  const neck = (y0, len, cx, gap) => { seg(cx - gap / 2, y0, cx - gap / 2, y0 + len, { r: 5 }); seg(cx + gap / 2, y0, cx + gap / 2, y0 + len, { r: 5 }); };
+  const rotor = (x, y, len, arms, omega, o = {}) => {
+    const shapes = [];
+    for (let k = 0; k < arms; k++) {
+      const a = k * TAU / arms, ex = Math.cos(a) * len, ey = Math.sin(a) * len;
+      shapes.push({ x1: 0, y1: 0, x2: ex, y2: ey, r: o.r || 5 });
+      if (o.tip) shapes.push({ x1: ex, y1: ey, x2: ex, y2: ey, r: o.tip, circ: true });
+    }
+    shapes.push({ x1: 0, y1: 0, x2: 0, y2: 0, r: 11, circ: true });
+    add({ kind: 'rotor', x, y, omega, angle: o.a0 || 0, shapes, bounce: o.bounce, style: 'mover' });
+  };
+  const swing = (px, py, len, dir, a0, amp, freq, ph) => add({
+    kind: 'swing', x: px, y: py, angle: a0, amp, freq, phase: ph,
+    shapes: [{ x1: 0, y1: 0, x2: dir * len, y2: 0, r: 7 }], style: 'mover' });
+  const slider = (x, y, x1, y1, x2, y2, ax, ay, freq, ph, o = {}) => add({
+    kind: 'slider', x, y, ax, ay, freq, phase: ph,
+    shapes: [{ x1, y1, x2, y2, r: o.r || 7 }], style: 'mover', bounce: o.bounce });
+
+  let y = 0;
+
+  /* 1. Start chamber + angled funnel (balls wait in rows around y=70..135) */
+  funnel(240, 240, 400, 200);
+  y = 480;
+
+  /* 2. Bumper lattice (pinball-style opening) */
+  for (let k = 0; k < 5; k++) {
+    const yy = y + 110 + k * 95, off = k % 2 ? 60 : 0;
+    for (let x = 90 + off; x <= 720; x += 120) dot(x, yy, 20);
+  }
+  y = 1060;
+
+  /* 3. Zig-zag corridor (39 deg slopes alternating sides) */
+  seg(0, y, 620, y + 500);
+  seg(W, y + 560, 180, y + 1060);
+  seg(0, y + 1120, 620, y + 1620);
+  y += 1700;
+
+  /* 4. Rotating paddles with a feeding deflector */
+  seg(W, y + 40, 470, y + 280);
+  rotor(330, y + 420, 150, 2, 1.7);
+  rotor(570, y + 680, 130, 2, -1.9);
+  rotor(300, y + 930, 150, 3, 2.1);
+  y += 1150;
+
+  /* 5. Split paths: tent -> two lanes -> ridge -> rejoin */
+  seg(400, y + 60, 340, y + 250); seg(400, y + 60, 460, y + 250);
+  seg(0, y + 330, 230, y + 560); seg(W, y + 330, 570, y + 560);
+  seg(400, y + 360, 340, y + 520); seg(400, y + 360, 460, y + 520);
+  funnel(y + 680, 240, 400, 200);
+  y += 960;
+
+  /* 6. Moving tilted platforms */
+  slider(400, y + 150, -120, -40, 120, 40, 200, 0, 0.20, 0);
+  slider(400, y + 420, -120, 40, 120, -40, 200, 0, 0.23, Math.PI);
+  slider(400, y + 690, -120, -40, 120, 40, 200, 0, 0.18, Math.PI / 2);
+  y += 900;
+
+  /* 7. Slow, rough (high friction) slopes */
+  const ROUGH = { style: 'rough', grip: 4, r: 7 };
+  seg(0, y, 560, y + 450, ROUGH);
+  seg(W, y + 520, 240, y + 990, ROUGH);
+  y += 1100;
+
+  /* 8. Oscillating gates */
+  swing(14, y + 150, 330, 1, 0.45, 0.5, 0.28, 0);
+  swing(786, y + 400, 330, -1, -0.45, 0.5, 0.26, 2);
+  swing(14, y + 650, 330, 1, 0.45, 0.5, 0.30, 4);
+  swing(786, y + 900, 330, -1, -0.45, 0.5, 0.25, 1);
+  y += 1150;
+
+  /* 9. Dead-end-looking trap: gap leads onto a shallow floor, then a spinner */
+  seg(W, y, 120, y + 520);
+  seg(0, y + 640, 560, y + 920);
+  rotor(660, y + 980, 110, 2, -2.2);
+  y += 1100;
+
+  /* 10. Pinball: kicker clusters, rails, spinner */
+  const cluster = (cx, cy) => {
+    dot(cx, cy - 45, 22, { bounce: 2 }); dot(cx - 50, cy + 35, 22, { bounce: 2 }); dot(cx + 50, cy + 35, 22, { bounce: 2 });
+  };
+  cluster(200, y + 140); cluster(600, y + 300); cluster(380, y + 470);
+  cluster(180, y + 640); cluster(620, y + 720);
+  seg(0, y + 360, 110, y + 520); seg(W, y + 560, 690, y + 720);
+  rotor(400, y + 900, 120, 2, 3.2);
+  y += 1050;
+
+  /* 11. Bounce stairs */
+  const BOUNCY = { style: 'bouncy', bounce: 1.9 };
+  seg(0, y, 380, y + 300, BOUNCY);
+  seg(W, y + 380, 420, y + 680, BOUNCY);
+  seg(0, y + 760, 380, y + 1060, BOUNCY);
+  seg(W, y + 1140, 420, y + 1440, BOUNCY);
+  y += 1500;
+
+  /* 12. Rotating gear pairs with round tips */
+  rotor(200, y + 200, 140, 3, 1.1, { tip: 14 });
+  rotor(600, y + 200, 140, 3, -1.1, { tip: 14 });
+  rotor(200, y + 680, 140, 3, -1.3, { tip: 14, a0: 0.5 });
+  rotor(600, y + 680, 140, 3, 1.3, { tip: 14, a0: 0.5 });
+  y += 1050;
+
+  /* 13. Narrowing funnels with necks */
+  funnel(y, 380, 260, 200); neck(y + 380, 110, 260, 200);
+  funnel(y + 560, 380, 540, 160); neck(y + 940, 110, 540, 160);
+  funnel(y + 1120, 380, 400, 110); neck(y + 1500, 110, 400, 110);
+  y += 1700;
+
+  /* 14. Large drop with scattered whisker deflectors */
+  [[100, 120, 1], [560, 250, -1], [300, 380, 1], [620, 520, 1], [260, 640, -1]].forEach(p =>
+    seg(p[0], y + p[1], p[0] + p[2] * 110, y + p[1] + 110, { r: 5 }));
+  y += 800;
+
+  /* 15. High-speed slick ramps */
+  const SLICK = { grip: 0.35, r: 6 };
+  seg(0, y, 430, y + 610, SLICK);
+  seg(W, y + 700, 370, y + 1310, SLICK);
+  y += 1400;
+
+  /* 16. Final chaotic gauntlet */
+  const g = y;
+  slider(400, g + 100, -130, -45, 130, 45, 190, 0, 0.26, 0);
+  rotor(240, g + 330, 130, 2, 2.3, { bounce: 1.2 });
+  rotor(560, g + 330, 130, 2, -2.5);
+  dot(400, g + 430, 26, { bounce: 2.1 });
+  swing(14, g + 620, 330, 1, 0.45, 0.5, 0.45, 0);
+  swing(786, g + 760, 330, -1, -0.45, 0.5, 0.42, 1.5);
+  seg(400, g + 900, 240, g + 1040); seg(400, g + 900, 560, g + 1040);
+  dot(110, g + 1000, 24, { bounce: 2 }); dot(690, g + 1000, 24, { bounce: 2 });
+  rotor(400, g + 1130, 160, 4, 2.8);
+  slider(400, g + 1330, 0, -70, 0, 70, 250, 0, 0.33, 0);
+  slider(400, g + 1330, 0, -70, 0, 70, 250, 0, 0.33, Math.PI);
+  funnel(g + 1450, 320, 400, 300);
+  y = g + 1800;
+
+  /* Finish line + catch floor + outer walls */
+  const finishY = y;
+  const height = finishY + 380;
+  seg(0, height - 70, W, height - 70, { r: 10 });
+  seg(-8, -300, -8, height + 300, { r: 8 });
+  seg(W + 8, -300, W + 8, height + 300, { r: 8 });
+  return { obstacles: obs, finishY, height };
+}
+
+/* =============================== BALL =============================== */
+class Ball {
+  constructor(c, x, y) {
+    this.c = c; this.name = c.name; this.code = c.code; this.idx = COUNTRIES.indexOf(c);
+    // tiny per-race physical imperfections
+    this.r = c.r * (1 + rand(-0.01, 0.01));
+    const den = c.density * (1 + rand(-0.015, 0.015));
+    this.m = den * this.r * this.r * 0.01; this.invM = 1 / this.m;
+    this.I = 0.4 * this.m * this.r * this.r; this.invI = 1 / this.I;     // solid-sphere style inertia
+    this.rest = c.rest + rand(-0.015, 0.015);
+    this.fric = c.fric + rand(-0.015, 0.015);
+    this.x = x; this.y = y; this.vx = rand(-6, 6); this.vy = rand(0, 6);
+    this.angle = rand(0, TAU); this.w = rand(-1.5, 1.5);
+    this.frozen = true; this.finishT = null;
+    this.gx = x; this.gy = y;                  // last known good position
+    this.chkT = 0; this.rx = x; this.ry = y; this.stuck = 0;
+  }
+}
+
+/* ============================ PHYSICS WORLD ========================= */
+class World {
+  constructor(course) {
+    this.obstacles = course.obstacles; this.finishY = course.finishY; this.height = course.height;
+    this.balls = []; this.time = 0; this.base = 0; this.impacts = [];
+  }
+  step(dt) {
+    const t = this.time + this.base;
+    for (const o of this.obstacles) if (o.dynamic) o.update(t);
+    const bs = this.balls;
+    for (const b of bs) if (!b.frozen) this.integrate(b, dt);
+    this.ballBall();
+    for (let i = 0; i < 3; i++) for (const b of bs) if (!b.frozen) this.ballObstacles(b);   // extra passes resolve pinches
+    for (const b of bs) if (!b.frozen) this.sanitize(b);
+    this.time += dt;
+  }
+  integrate(b, dt) {
+    b.vy += GRAVITY * dt;                       // gravity (semi-implicit Euler)
+    const d = 1 / (1 + LIN_DRAG * dt);
+    b.vx *= d; b.vy *= d;
+    const s2 = b.vx * b.vx + b.vy * b.vy;
+    if (s2 > MAX_SPEED * MAX_SPEED) { const k = MAX_SPEED / Math.sqrt(s2); b.vx *= k; b.vy *= k; }
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.angle += b.w * dt;
+    b.w *= 1 / (1 + ANG_DRAG * dt);
+    b.w = clamp(b.w, -MAX_SPIN, MAX_SPIN);
+  }
+  sanitize(b) {
+    if (!isFinite(b.x) || !isFinite(b.y) || !isFinite(b.vx) || !isFinite(b.vy) || !isFinite(b.w)) {
+      b.x = b.gx; b.y = b.gy; b.vx = 0; b.vy = 0; b.w = 0; return;
+    }
+    // last-resort containment (should never trigger)
+    if (b.x < b.r) { b.x = b.r; if (b.vx < 0) b.vx = 0; }
+    if (b.x > W - b.r) { b.x = W - b.r; if (b.vx > 0) b.vx = 0; }
+    if (b.y < -100) { b.y = -100; if (b.vy < 0) b.vy = 0; }
+    if (b.y > this.height - 40) { b.y = this.height - 40; if (b.vy > 0) b.vy = 0; }
+    b.gx = b.x; b.gy = b.y;
+  }
+  /* ---- ball vs ball: impulse with restitution + tangential friction ---- */
+  ballBall() {
+    const bs = this.balls;
+    for (let i = 0; i < bs.length; i++) {
+      const a = bs[i]; if (a.frozen) continue;
+      for (let j = i + 1; j < bs.length; j++) {
+        const b = bs[j]; if (b.frozen) continue;
+        const dx = b.x - a.x, dy = b.y - a.y, md = a.r + b.r, d2 = dx * dx + dy * dy;
+        if (d2 >= md * md) continue;
+        let d = Math.sqrt(d2), nx, ny;
+        if (d > 1e-6) { nx = dx / d; ny = dy / d; } else { nx = 0; ny = 1; d = 0; }
+        const tot = a.invM + b.invM, pen = md - d;
+        // positional correction split by inverse mass
+        a.x -= nx * pen * a.invM / tot; a.y -= ny * pen * a.invM / tot;
+        b.x += nx * pen * b.invM / tot; b.y += ny * pen * b.invM / tot;
+        // contact velocities including spin: v + w x r
+        const arx = nx * a.r, ary = ny * a.r, brx = -nx * b.r, bry = -ny * b.r;
+        const avx = a.vx - a.w * ary, avy = a.vy + a.w * arx;
+        const bvx = b.vx - b.w * bry, bvy = b.vy + b.w * brx;
+        const rvx = bvx - avx, rvy = bvy - avy;
+        const vn = rvx * nx + rvy * ny;
+        if (vn >= 0) continue;                   // separating
+        const e = -vn < REST_THRESHOLD ? 0 : Math.min(a.rest, b.rest);
+        const jn = -(1 + e) * vn / tot;          // normal impulse magnitude
+        a.vx -= nx * jn * a.invM; a.vy -= ny * jn * a.invM;
+        b.vx += nx * jn * b.invM; b.vy += ny * jn * b.invM;
+        // friction along tangent (Coulomb, clamped by mu * normal impulse)
+        const tx = -ny, ty = nx;
+        const avx2 = a.vx - a.w * ary, avy2 = a.vy + a.w * arx;
+        const bvx2 = b.vx - b.w * bry, bvy2 = b.vy + b.w * brx;
+        const vt = (bvx2 - avx2) * tx + (bvy2 - avy2) * ty;
+        const denom = a.invM + b.invM + a.r * a.r * a.invI + b.r * b.r * b.invI;
+        const mu = Math.sqrt(a.fric * b.fric);
+        const jt = clamp(-vt / denom, -mu * jn, mu * jn);
+        a.vx -= tx * jt * a.invM; a.vy -= ty * jt * a.invM; a.w -= a.r * jt * a.invI;
+        b.vx += tx * jt * b.invM; b.vy += ty * jt * b.invM; b.w -= b.r * jt * b.invI;
+        if (-vn > 90 && this.impacts.length < 24) this.impacts.push({ v: -vn, s: 'ball' });
+      }
+    }
+  }
+  /* ---- ball vs obstacles (capsules, possibly moving) ---- */
+  ballObstacles(b) {
+    const obs = this.obstacles, r = b.r;
+    for (let i = 0; i < obs.length; i++) {
+      const o = obs[i];
+      if (b.x + r < o.bx0 || b.x - r > o.bx1 || b.y + r < o.by0 || b.y - r > o.by1) continue;
+      const ws = o.ws;
+      for (let k = 0; k < ws.length; k++) {
+        const s = ws[k];
+        const abx = s.bx - s.ax, aby = s.by - s.ay, l2 = abx * abx + aby * aby;
+        let t = l2 > 1e-9 ? ((b.x - s.ax) * abx + (b.y - s.ay) * aby) / l2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const px = s.ax + abx * t, py = s.ay + aby * t;
+        const dx = b.x - px, dy = b.y - py, rr = r + s.r, d2 = dx * dx + dy * dy;
+        if (d2 >= rr * rr) continue;
+        let d = Math.sqrt(d2), nx, ny;
+        if (d > 1e-6) { nx = dx / d; ny = dy / d; }
+        else { const l = Math.sqrt(l2) || 1; nx = aby / l; ny = -abx / l; if (ny > 0) { nx = -nx; ny = -ny; } d = 0; }
+        this.resolve(b, o, px, py, nx, ny, rr - d);
+      }
+    }
+  }
+  resolve(b, o, px, py, nx, ny, pen) {
+    b.x += nx * pen; b.y += ny * pen;                       // remove penetration
+    // surface velocity of the obstacle at the contact point
+    const sx = o.vx - o.w * (py - o.cy), sy = o.vy + o.w * (px - o.cx);
+    // ball contact-point velocity: v + w x (-n r)
+    const cvx = b.vx + b.w * ny * b.r, cvy = b.vy - b.w * nx * b.r;
+    const vn = (cvx - sx) * nx + (cvy - sy) * ny;           // relative normal velocity
+    if (vn >= 0) return;
+    const e = -vn < REST_THRESHOLD ? 0 : Math.min(1.25, b.rest * o.bounce);
+    const jn = -(1 + e) * vn * b.m;                          // obstacle has infinite mass
+    b.vx += nx * jn * b.invM; b.vy += ny * jn * b.invM;
+    // Coulomb friction along tangent, uses (post-normal-impulse) relative tangential velocity
+    const tx = -ny, ty = nx;
+    const cvx2 = b.vx + b.w * ny * b.r, cvy2 = b.vy - b.w * nx * b.r;
+    const vt = (cvx2 - sx) * tx + (cvy2 - sy) * ty;
+    const denom = b.invM + b.r * b.r * b.invI;
+    const mu = Math.min(1.5, b.fric * o.grip);
+    const jt = clamp(-vt / denom, -mu * jn, mu * jn);
+    b.vx += tx * jt * b.invM; b.vy += ty * jt * b.invM;
+    b.w -= b.r * jt * b.invI;
+    if (-vn > 90 && this.impacts.length < 24) this.impacts.push({ v: -vn, s: o.style });
+  }
+}
+
+/* ============================ RACE STATE ============================ */
+/* Pure logic (no DOM): idle -> countdown -> racing -> winner -> countdown ... */
+class RaceSim {
+  constructor(course, hooks) {
+    this.course = course; this.world = new World(course); this.hooks = hooks || {};
+    this.raceNo = 0; this.state = 'idle'; this.stateT = 0; this.winner = null;
+    this.lastCount = null; this.lastTick = null; this.raceTime = 0; this.kicks = 0;
+  }
+  hook(name, a) { const f = this.hooks[name]; if (f) f(a); }
+  newRace() {
+    this.raceNo++;
+    const w = this.world;
+    w.time = 0; w.base = rand(0, 40); w.impacts.length = 0;
+    // shuffled starting slots: 2 rows x 5 columns, tiny jitter
+    const slots = [];
+    for (let row = 0; row < 2; row++) for (let col = 0; col < 5; col++) slots.push([160 + col * 120, 70 + row * 65]);
+    shuffle(slots);
+    w.balls = COUNTRIES.map((c, i) => new Ball(c, slots[i][0] + rand(-3, 3), slots[i][1] + rand(-2, 2)));
+    this.winner = null; this.state = 'countdown'; this.stateT = -LEAD_IN;
+    this.lastCount = null; this.lastTick = null; this.raceTime = 0;
+    this.hook('onNewRace');
+  }
+  /** Current order: finished balls by finish time, then the rest by depth. */
+  order() {
+    return this.world.balls.slice().sort((a, b) => {
+      if (a.finishT != null || b.finishT != null) {
+        if (a.finishT == null) return 1; if (b.finishT == null) return -1; return a.finishT - b.finishT;
+      }
+      return b.y - a.y;
+    });
+  }
+  update(dt) {
+    if (this.state === 'idle') this.newRace();
+    const w = this.world, sub = dt / SUBSTEPS;
+    for (let i = 0; i < SUBSTEPS; i++) w.step(sub);
+    this.stateT += dt;
+    if (this.state === 'countdown') {
+      if (this.stateT >= COUNTDOWN) {
+        for (const b of w.balls) b.frozen = false;
+        this.state = 'racing'; this.stateT = 0; this.raceTime = 0;
+        this.hook('onGo');
+      } else if (this.stateT >= 0) {
+        const n = COUNTDOWN - Math.floor(this.stateT);
+        if (n !== this.lastCount) { this.lastCount = n; this.hook('onCount', n); }
+      }
+    } else if (this.state === 'racing') {
+      this.raceTime = this.stateT;
+      this.checkStuck(dt);
+      this.checkFinish();
+    } else if (this.state === 'winner') {
+      const left = Math.ceil(WINNER_SECONDS - this.stateT);
+      if (left !== this.lastTick && left > 0) { this.lastTick = left; this.hook('onTick', left); }
+      if (this.stateT >= WINNER_SECONDS) this.newRace();
+    }
+  }
+  /** The winner is simply the first ball whose centre crosses the finish line. */
+  checkFinish() {
+    const w = this.world; let best = null;
+    for (const b of w.balls) {
+      if (b.finishT == null && b.y >= w.finishY) { b.finishT = this.raceTime; if (!best || b.y > best.y) best = b; }
+    }
+    if (!best && this.raceTime > RACE_TIMEOUT) {            // safety net only; still position-based
+      best = w.balls.reduce((m, b) => (b.y > m.y ? b : m), w.balls[0]); best.finishT = this.raceTime;
+    }
+    if (best) {
+      this.winner = best; this.state = 'winner'; this.stateT = 0; this.lastTick = null;
+      this.hook('onWinner', best); this.hook('onTick', WINNER_SECONDS); this.lastTick = WINNER_SECONDS;
+    }
+  }
+  /** If a ball barely moves for ~3 s, give it a small shake so no ball is stuck forever. */
+  checkStuck(dt) {
+    for (const b of this.world.balls) {
+      if (b.finishT != null) continue;
+      b.chkT += dt;
+      if (b.chkT < 1) continue;
+      b.chkT = 0;
+      if (Math.hypot(b.x - b.rx, b.y - b.ry) < 18) b.stuck++; else b.stuck = 0;
+      b.rx = b.x; b.ry = b.y;
+      if (b.stuck >= 3) {
+        b.vx += (Math.random() < 0.5 ? -1 : 1) * rand(120, 220); b.vy -= rand(80, 160); b.w += rand(-8, 8);
+        b.stuck = 0; this.kicks++;
+      }
+    }
+  }
+}
+
+/* ============================== CAMERA ============================== */
+class Camera {
+  constructor() { this.y = 0; this.scale = 1; this.viewH = 900; }
+  resize(cw, ch) {
+    this.scale = Math.min(cw / (W + 60), ch / 950);
+    this.viewH = ch / this.scale;
+  }
+  limits(H) { return [this.viewH / 2 - 60, Math.max(this.viewH / 2 - 60, H - this.viewH / 2 + 60)]; }
+  snap(H) { this.y = this.limits(H)[0]; }
+  follow(balls, dt, H) {
+    let lead = -1e9, sum = 0;
+    for (const b of balls) { lead = Math.max(lead, b.y); sum += b.y; }
+    const avg = sum / balls.length;
+    const target = lead * 0.55 + avg * 0.45 + this.viewH * 0.12;      // look ahead a little
+    this.y += (target - this.y) * (1 - Math.exp(-3.2 * dt));          // smooth, slight lag
+    const need = lead - this.viewH * 0.36;                            // never let the leader fall off-screen
+    if (this.y < need) this.y += (need - this.y) * 0.2;
+    const [lo, hi] = this.limits(H);
+    this.y = clamp(this.y, lo, hi);
+  }
+}
+
+/* ============================== RENDERER ============================ */
+const FONT = '-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif';
+class Renderer {
+  constructor(canvas) {
+    this.cv = canvas; this.ctx = canvas.getContext('2d');
+    this.cw = 1; this.ch = 1; this.dpr = 1; this.bg = null;
+    this.sprites = COUNTRIES.map(c => {            // pre-rendered flag textures
+      const s = document.createElement('canvas'); s.width = 192; s.height = 128;
+      c.draw(s.getContext('2d'), 192, 128); return s;
+    });
+  }
+  resize(cam) {
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    this.cw = Math.max(1, window.innerWidth); this.ch = Math.max(1, window.innerHeight);
+    this.cv.width = Math.round(this.cw * this.dpr); this.cv.height = Math.round(this.ch * this.dpr);
+    cam.resize(this.cw, this.ch);
+    const ctx = this.ctx;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.bg = ctx.createLinearGradient(0, 0, 0, this.ch);
+    this.bg.addColorStop(0, '#15171c'); this.bg.addColorStop(1, '#090a0d');
+  }
+  render(sim, cam, fade) {
+    const ctx = this.ctx, dpr = this.dpr, s = cam.scale, w = sim.world;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = this.bg; ctx.fillRect(0, 0, this.cw, this.ch);
+    // world transform
+    ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * (this.cw / 2 - W / 2 * s), dpr * (this.ch / 2 - cam.y * s));
+    const top = cam.y - cam.viewH / 2 - 120, bot = cam.y + cam.viewH / 2 + 120;
+    // playfield
+    const pf = ctx.createLinearGradient(0, 0, W, 0);
+    pf.addColorStop(0, '#101217'); pf.addColorStop(0.5, '#13151b'); pf.addColorStop(1, '#101217');
+    ctx.fillStyle = pf; ctx.fillRect(0, top, W, bot - top);
+    // faint depth lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)'; ctx.lineWidth = 1 / s; ctx.beginPath();
+    for (let yy = Math.floor(top / 250) * 250; yy < bot; yy += 250) { ctx.moveTo(0, yy); ctx.lineTo(W, yy); }
+    ctx.stroke();
+    this.drawFinish(ctx, w.finishY, top, bot);
+    for (const o of w.obstacles) {
+      if (o.by1 < top || o.by0 > bot) continue;
+      this.drawObstacle(ctx, o, s);
+    }
+    for (const b of w.balls) this.drawBall(ctx, b, this.sprites[b.idx]);
+    this.drawHUD(sim);
+    if (fade > 0.001) {                       // fade-in after each reset hides the camera cut
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = 'rgba(10,11,14,' + fade.toFixed(3) + ')'; ctx.fillRect(0, 0, this.cw, this.ch);
+    }
+  }
+  drawFinish(ctx, fy, top, bot) {
+    if (fy < top - 60 || fy > bot + 60) return;
+    const sq = 20;
+    for (let i = 0; i < W / sq; i++) for (let j = 0; j < 2; j++) {
+      ctx.fillStyle = (i + j) % 2 ? 'rgba(255,255,255,0.92)' : 'rgba(20,20,24,0.95)';
+      ctx.fillRect(i * sq, fy - sq + j * sq, sq, sq);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = `700 15px ${FONT}`; ctx.textAlign = 'center';
+    ctx.fillText('F I N I S H', W / 2, fy - sq - 12);
+  }
+  drawObstacle(ctx, o, s) {
+    const st = o.dynamic ? 'mover' : o.style;
+    const pal = {
+      wall:   ['#4b5361', '#262a33'], rough: ['#7a6a58', '#2e2924'], bouncy: ['#2fa593', '#16403b'],
+      bumper: ['#e0a93f', '#3a2c12'], mover: ['#7aa0e6', '#26344f'],
+    }[st] || ['#4b5361', '#262a33'];
+    ctx.lineCap = 'round';
+    if (st === 'mover') { ctx.shadowColor = 'rgba(110,150,230,0.35)'; ctx.shadowBlur = 12; }
+    if (st === 'bumper') { ctx.shadowColor = 'rgba(230,170,60,0.35)'; ctx.shadowBlur = 14; }
+    for (const sh of o.ws) {
+      if (sh.circ) {
+        const g = ctx.createRadialGradient(sh.ax - sh.r * 0.3, sh.ay - sh.r * 0.3, sh.r * 0.1, sh.ax, sh.ay, sh.r);
+        g.addColorStop(0, pal[0]); g.addColorStop(1, pal[1]);
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sh.ax, sh.ay, sh.r, 0, TAU); ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = pal[0]; ctx.stroke();
+      } else {
+        ctx.strokeStyle = pal[0]; ctx.lineWidth = sh.r * 2;
+        ctx.beginPath(); ctx.moveTo(sh.ax, sh.ay); ctx.lineTo(sh.bx, sh.by); ctx.stroke();
+        ctx.strokeStyle = pal[1]; ctx.lineWidth = Math.max(1, sh.r * 2 - 3.5);
+        ctx.beginPath(); ctx.moveTo(sh.ax, sh.ay); ctx.lineTo(sh.bx, sh.by); ctx.stroke();
+        if (st === 'rough') {
+          ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2; ctx.setLineDash([3, 7]);
+          ctx.beginPath(); ctx.moveTo(sh.ax, sh.ay); ctx.lineTo(sh.bx, sh.by); ctx.stroke(); ctx.setLineDash([]);
+        }
+      }
+    }
+    ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+  }
+  /* Glossy 3D marble drawn only with canvas primitives */
+  drawBall(ctx, b, sprite) {
+    const r = b.r, x = b.x, y = b.y;
+    // 1. soft drop shadow
+    let g = ctx.createRadialGradient(x + r * 0.2, y + r * 0.42, r * 0.2, x + r * 0.2, y + r * 0.42, r * 1.45);
+    g.addColorStop(0, 'rgba(0,0,0,0.5)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x + r * 0.2, y + r * 0.42, r * 1.45, 0, TAU); ctx.fill();
+    // 2. flag texture clipped to the sphere and rotating with physics spin
+    ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip();
+    ctx.translate(x, y); ctx.rotate(b.angle);
+    ctx.drawImage(sprite, -r * 1.55, -r * 1.03, r * 3.1, r * 2.07);
+    ctx.rotate(-b.angle); ctx.translate(-x, -y);
+    // 3. sphere shading (light from upper-left): darkens toward the lower right and rim
+    g = ctx.createRadialGradient(x - r * 0.38, y - r * 0.42, r * 0.1, x, y, r * 1.05);
+    g.addColorStop(0, 'rgba(255,255,255,0.10)'); g.addColorStop(0.45, 'rgba(0,0,0,0.05)');
+    g.addColorStop(0.8, 'rgba(0,0,0,0.38)'); g.addColorStop(1, 'rgba(0,0,0,0.68)');
+    ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    // 4. cool rim light on the shadow side
+    g = ctx.createRadialGradient(x + r * 0.35, y + r * 0.4, r * 0.55, x + r * 0.2, y + r * 0.25, r * 1.05);
+    g.addColorStop(0, 'rgba(120,170,255,0)'); g.addColorStop(0.85, 'rgba(120,170,255,0)'); g.addColorStop(1, 'rgba(140,185,255,0.38)');
+    ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    ctx.restore();
+    // 5. glossy specular highlight
+    ctx.save(); ctx.translate(x - r * 0.36, y - r * 0.42); ctx.rotate(-0.7); ctx.scale(1, 0.62);
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.46);
+    g.addColorStop(0, 'rgba(255,255,255,0.95)'); g.addColorStop(0.5, 'rgba(255,255,255,0.35)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r * 0.46, 0, TAU); ctx.fill(); ctx.restore();
+    // 6. small secondary reflection (bounce light)
+    ctx.save(); ctx.translate(x + r * 0.42, y + r * 0.46); ctx.rotate(0.8); ctx.scale(1, 0.5);
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.3);
+    g.addColorStop(0, 'rgba(190,215,255,0.5)'); g.addColorStop(1, 'rgba(190,215,255,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r * 0.3, 0, TAU); ctx.fill(); ctx.restore();
+    // 7. edge definition
+    ctx.lineWidth = 1.2; ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath(); ctx.arc(x, y, r - 0.4, 0, TAU); ctx.stroke();
+  }
+  spaced(ctx, text, x, y, sp) {
+    for (const ch of text) { ctx.fillText(ch, x, y); x += ctx.measureText(ch).width + sp; }
+  }
+  drawHUD(sim) {
+    const ctx = this.ctx, cw = this.cw, dpr = this.dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const pad = 16, small = cw < 520;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.font = `800 ${small ? 13 : 16}px ${FONT}`;
+    this.spaced(ctx, 'FLAG FALL RACE', pad, pad + 14, small ? 2.6 : 3.4);
+    ctx.fillStyle = 'rgba(255,255,255,0.42)'; ctx.font = `600 ${small ? 11 : 12}px ${FONT}`;
+    this.spaced(ctx, 'RACE #' + sim.raceNo, pad, pad + 32, 1.6);
+    // compact live leaderboard
+    const ord = sim.order(), rowH = clamp(this.ch * 0.034, 13, small ? 17 : 20), pw = small ? 104 : 124, ph = rowH * 10 + 12;
+    const px = cw - pw - 12, py = 12;
+    ctx.fillStyle = 'rgba(12,13,17,0.62)'; this.roundRect(ctx, px, py, pw, ph, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.font = `700 ${small ? 10 : 11}px ${FONT}`;
+    for (let i = 0; i < ord.length; i++) {
+      const b = ord[i], yy = py + 6 + i * rowH, fw = small ? 18 : 22, fh = fw * 0.66;
+      ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.fillText(String(i + 1), px + 8, yy + rowH * 0.7);
+      ctx.drawImage(this.sprites[b.idx], px + 24, yy + (rowH - fh) / 2, fw, fh);
+      ctx.fillStyle = i === 0 ? '#fff' : 'rgba(255,255,255,0.7)';
+      ctx.fillText(b.code, px + 28 + fw, yy + rowH * 0.7);
+    }
+    // thin progress rail on the left edge
+    const w = sim.world, bar = this.ch * 0.5, bx = 8, by = (this.ch - bar) / 2;
+    ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(bx, by, 3, bar);
+    for (const b of w.balls) {
+      const p = clamp(b.y / w.finishY, 0, 1);
+      ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.fillRect(bx - 1, by + p * bar - 1, 5, 2);
+    }
+  }
+  roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+}
+
+/* ================================ AUDIO ============================= */
+/* Procedural Web Audio; fails silently if the browser blocks it. */
+class AudioFX {
+  constructor() { this.ctx = null; this.muted = false; this.lastImpact = 0; }
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return; this.ctx = new AC(); }
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+    } catch (e) { /* audio is optional */ }
+  }
+  tone(freq, dur, type, vol, slideTo, delay) {
+    const c = this.ctx; if (!c || this.muted || c.state !== 'running') return;
+    try {
+      const t0 = c.currentTime + (delay || 0), o = c.createOscillator(), g = c.createGain();
+      o.type = type || 'sine'; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vol, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(c.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch (e) { /* ignore */ }
+  }
+  count() { this.tone(660, 0.14, 'sine', 0.14); }
+  go() { this.tone(990, 0.4, 'triangle', 0.18); this.tone(1320, 0.4, 'sine', 0.08, null, 0.02); }
+  win() { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.5, 'triangle', 0.14, null, i * 0.12)); }
+  impact(list) {
+    if (!this.ctx || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastImpact < 0.04) return;
+    let best = null; for (const e of list) if (!best || e.v > best.v) best = e;
+    if (!best) return;
+    this.lastImpact = now;
+    const vol = clamp(best.v / 700, 0.03, 0.2);
+    if (best.s === 'bumper') this.tone(rand(520, 780), 0.12, 'sine', vol + 0.04, 300);
+    else if (best.s === 'bouncy') this.tone(rand(300, 420), 0.1, 'sine', vol, 200);
+    else if (best.s === 'ball') this.tone(rand(300, 380), 0.07, 'sine', vol * 0.9, 220);
+    else this.tone(rand(120, 200), 0.07, 'triangle', vol, 80);
+  }
+}
+
+/* ================================ GAME ============================== */
+class Game {
+  constructor() {
+    this.canvas = document.getElementById('c');
+    this.countEl = document.getElementById('count');
+    this.winEl = document.getElementById('win');
+    this.wname = document.getElementById('wname');
+    this.wnum = document.getElementById('wnum');
+    this.wflag = document.getElementById('wflag');
+    this.snd = document.getElementById('snd');
+    this.fx = new AudioFX();
+    this.cam = new Camera();
+    this.renderer = new Renderer(this.canvas);
+    this.course = buildCourse();
+    this.sim = new RaceSim(this.course, {
+      onNewRace: () => { this.winEl.classList.remove('show'); this.cam.snap(this.course.height); this.fade = 1; },
+      onCount: n => { this.flash(String(n), 950); this.fx.count(); },
+      onGo: () => { this.flash('GO!', 800); this.fx.go(); },
+      onWinner: b => this.showWinner(b),
+      onTick: n => { this.wnum.textContent = String(n); this.pop(this.wnum); },
+    });
+    this.acc = 0; this.last = 0; this.raf = 0; this.started = false; this.fade = 1;
+    this.loop = this.loop.bind(this);
+  }
+  flash(text, ms) {
+    this.countEl.textContent = text;
+    if (this.countEl.animate) this.countEl.animate([
+      { opacity: 0, transform: 'translateY(-50%) scale(1.5)' },
+      { opacity: 1, transform: 'translateY(-50%) scale(1)', offset: 0.22 },
+      { opacity: 1, transform: 'translateY(-50%) scale(0.98)', offset: 0.7 },
+      { opacity: 0, transform: 'translateY(-50%) scale(0.9)' },
+    ], { duration: ms, easing: 'ease-out' });
+  }
+  pop(el) {
+    if (el.animate) el.animate([{ transform: 'scale(1.22)', opacity: 0.6 }, { transform: 'scale(1)', opacity: 1 }], { duration: 300, easing: 'ease-out' });
+  }
+  showWinner(b) {
+    this.wname.textContent = b.name + ' WINS!';
+    const c = this.wflag.getContext('2d'); c.clearRect(0, 0, this.wflag.width, this.wflag.height);
+    c.drawImage(this.renderer.sprites[b.idx], 0, 0, this.wflag.width, this.wflag.height);
+    this.winEl.classList.add('show');
+    this.fx.win();
+  }
+  start() {
+    if (this.started) return;                 // guarantees a single loop
+    this.started = true;
+    const resize = () => this.renderer.resize(this.cam);
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', () => { resize(); setTimeout(resize, 250); });
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+    document.addEventListener('visibilitychange', () => { this.last = performance.now(); this.acc = 0; });
+    resize();
+    const unlock = () => this.fx.unlock();
+    ['pointerdown', 'keydown', 'touchstart'].forEach(e => window.addEventListener(e, unlock, { passive: true }));
+    this.snd.addEventListener('click', ev => {
+      ev.stopPropagation(); this.fx.unlock(); this.fx.muted = !this.fx.muted;
+      this.snd.textContent = this.fx.muted ? '🔇' : '🔊';
+    });
+    window.addEventListener('keydown', ev => { if (ev.key === 'm' || ev.key === 'M') this.snd.click(); });
+    this.sim.newRace();
+    this.last = performance.now();
+    this.raf = requestAnimationFrame(this.loop);
+  }
+  loop(now) {
+    this.raf = requestAnimationFrame(this.loop);
+    let dt = (now - this.last) / 1000; this.last = now;
+    if (!(dt > 0)) dt = 0; if (dt > 0.1) dt = 0.1;           // tab switches / hiccups never cause huge steps
+    this.acc += dt;
+    let n = 0;
+    try {
+      while (this.acc >= STEP && n < 12) { this.sim.update(STEP); this.acc -= STEP; n++; }
+    } catch (err) {                                        // never let one bad frame kill the endless loop
+      console.error(err); this.acc = 0; this.sim.newRace();
+    }
+    if (n === 12) this.acc = 0;
+    this.fade = Math.max(0, this.fade - dt / 0.7);
+    const imp = this.sim.world.impacts;
+    if (imp.length) { this.fx.impact(imp); imp.length = 0; }
+    this.cam.follow(this.sim.world.balls, dt, this.course.height);
+    this.renderer.render(this.sim, this.cam, this.fade);
+  }
+}
+
+/* ================================ BOOT ============================== */
+if (typeof window !== 'undefined' && typeof document !== 'undefined' && !window.__FFR_TEST) {
+  window.__ffr = new Game();
+  window.__ffr.start();
+}
+</script>
+</body>
+</html>
